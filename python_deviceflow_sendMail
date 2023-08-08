@@ -1,0 +1,127 @@
+#!/usr/bin/env python3.7
+
+#change in azure app: Allow public client flows --> YES
+
+#import sys  # For simplicity, we'll read config file from 1st CLI param sys.argv[1]
+import sys, os, atexit, json, logging, base64
+import requests, msal
+
+# Optional logging
+# logging.basicConfig(level=logging.DEBUG)
+
+config = {
+    "authority": "https://login.microsoftonline.com/common",
+    "client_id": "*************************",
+    "user_id": "",
+    "scope": ["User.Read","Mail.Send"],
+    "endpointTEST": "https://graph.microsoft.com/v1.0/me",
+    "endpointMAIL": "https://graph.microsoft.com/v1.0/users/{userId}/sendMail",
+    "token_cache": "token.cache"
+}
+
+#prepare attachments
+def prepare_attachment(file_path):
+    if not os.path.exists(file_path):
+        print('file is not found')
+        return
+
+    with open(file_path, 'rb') as upload:
+        media_content = base64.b64encode(upload.read())
+
+    data_body = {
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        'contentBytes': media_content.decode('utf-8'),
+        'name': os.path.basename(file_path)
+    }
+    return data_body
+
+
+# MAIN #
+cache = msal.SerializableTokenCache()
+if os.path.exists(config["token_cache"]):
+    cache.deserialize(open(config["token_cache"], "r").read())
+atexit.register(lambda:
+    open(config["token_cache"], "w").write(cache.serialize())
+    # Hint: The following optional line persists only when state changed
+    if cache.has_state_changed else None
+    )
+
+# Create a preferably long-lived app instance which maintains a token cache.
+app = msal.PublicClientApplication(
+    config["client_id"], authority=config["authority"],
+    token_cache=cache
+    )
+
+# The pattern to acquire a token looks like this.
+result = None
+
+# Note: If your device-flow app does not have any interactive ability, you can
+#   completely skip the following cache part. But here we demonstrate it anyway.
+# We now check the cache to see if we have some end users signed in before.
+accounts = app.get_accounts()
+if accounts:
+    logging.info("Account(s) exists in cache, probably with token too. Let's try.")
+    # Assuming there is only one for our script
+    chosen = accounts[0]
+    config["user_id"] = chosen["local_account_id"] #set userId in config.
+    # Now let's try to find a token in cache for this account
+    result = app.acquire_token_silent(config["scope"], account=chosen)
+
+if not result:
+    logging.info("No suitable token exists in cache. Let's get a new one from AAD.")
+
+    flow = app.initiate_device_flow(scopes=config["scope"])
+    if "user_code" not in flow:
+        raise ValueError(
+            "Fail to create device flow. Err: %s" % json.dumps(flow, indent=4))
+
+    print(flow["message"])
+    sys.stdout.flush()  # Some terminal needs this to ensure the message is shown
+
+    result = app.acquire_token_by_device_flow(flow)
+
+    #set user_id after getting initial token.
+    accounts = app.get_accounts()
+    if accounts:
+        # Assuming there is only one for our script
+        chosen = accounts[0]
+        config["user_id"] = chosen["local_account_id"] #set userId in config.
+
+if "access_token" in result:
+    # Calling graph API using the access token
+    if len(sys.argv) == 1: # if no arguments are given, run the mail flow.
+        userId = config["user_id"]
+        endpoint = f'https://graph.microsoft.com/v1.0/users/{userId}/sendMail'
+        # Mail message
+        email_msg = {'Message': {'Subject': "Test Sending Email from Python",
+                                 'Importance': "normal",
+                                 'Body': {'ContentType': 'Text', 'Content': "This is a test email."},
+                                 'ToRecipients': [
+                                     {'EmailAddress': {'Address': "mail1@mail.com"}},
+                                     {'EmailAddress': {'Address': "mail2@mail.com"}}
+                                 ],
+                                 'Attachments': [
+                                     prepare_attachment('test.txt'),
+                                     prepare_attachment('test.txt')
+                                 ]
+                                 },
+                     'SaveToSentItems': 'true'}
+        # Calling graph using the access token
+        graph_data = requests.post(  # Use token to call downstream service
+            endpoint,
+            headers={'Authorization': 'Bearer ' + result['access_token']},
+            json=email_msg)
+        if graph_data.ok:
+            print("Sent email succesfully")
+        else:
+            print(graph_data)
+    else:
+        if sys.argv[1] == "test":
+            graph_data = requests.get(  # Use token to call downstream service
+                config["endpointTEST"],
+                headers={'Authorization': 'Bearer ' + result['access_token']},).json()
+            print("Graph API call result: %s" % json.dumps(graph_data, indent=2))
+else:
+    print(result.get("error"))
+    print(result.get("error_description"))
+    print(result.get("correlation_id"))  # You may need this when reporting a bug
